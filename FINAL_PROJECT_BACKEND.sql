@@ -39,47 +39,56 @@ CREATE OR REPLACE PACKAGE BODY USERPACKAGE AS
         COPY_COUNT NUMBER;
         ROWCOUNT NUMBER;
         BORROWED VARCHAR2(5) := 'FALSE';
-        
-        CURSOR RESERVED_CURSOR IS SELECT BOOK_ID, BORROWER_ID FROM RESERVED_BOOKS;            
-        RBOOK_ID RESERVED_BOOKS.BOOK_ID%TYPE;
-        RBORROWER_ID RESERVED_BOOKS.BORROWER_ID%TYPE;
+        RESERVED_COUNT NUMBER;
+        PRIORITY_ID NUMBER; -- ID OF THE FIRST PERSON TO RESERVE (THE ONE WITH THE LOWEST R_BOOK_ID)
     BEGIN
         SELECT B_BOOKID_SEQ.CURRVAL INTO B_BOOK_SEQ FROM DUAL;
         SELECT BOOK_NAME, RESERVED, BOOK_COUNT INTO BOOK_NAME, IS_RESERVED, COPY_COUNT FROM LIBRARY_BOOKS WHERE LIBRARY_BOOKS.BOOK_ID = BORROWBOOK.BOOK_ID;
         
-        IF RESERVED_CURSOR%ISOPEN THEN
-            DBMS_OUTPUT.PUT_LINE('Cursor is open.');
-            CLOSE RESERVED_CURSOR;
-            DBMS_OUTPUT.PUT_LINE('Cursor is now closed.');
-        END IF;
+        -- SELECTS THE USER THAT WILL BE PRIORITIZED TO BORROW A BOOK IF THE BOOK IS RESERVED BY MULTIPLE PEOPLE
+--        SELECT RESERVER_ID INTO PRIORITY_ID FROM 
+--            (SELECT RESERVER_ID FROM RESERVED_BOOKS WHERE RESERVED_BOOKS.BOOK_ID = BORROWBOOK.BOOK_ID) -- ONLY CONSIDER BOOKS THAT THE USER IS TRYING TO BORROW
+--            WHERE RESERVED_BOOKS.R_BOOK_ID = MIN(R_BOOK_ID); -- SELECT THE ONE THAT HAS THE LOWEST R_BOOK_ID
         
         IF IS_RESERVED = 'FALSE' OR COPY_COUNT > 1 THEN
-            UPDATE LIBRARY_BOOKS SET BOOK_COUNT = BOOK_COUNT - 1 WHERE LIBRARY_BOOKS.BOOK_ID = BORROWBOOK.BOOK_ID;
-            UPDATE BORROWED_BOOKS SET BORROWER_ID = USER_ID WHERE B_BOOK_ID = (B_BOOK_SEQ + 1);
-            DBMS_OUTPUT.PUT_LINE('You have successfully borrowed the book ' || BOOK_NAME || '. Your Borrowing Book ID is ' || (B_BOOK_SEQ + 1));
-            BORROWED := 'TRUE';
+            IF COPY_COUNT <> 0 THEN
+                UPDATE LIBRARY_BOOKS SET BOOK_COUNT = BOOK_COUNT - 1 WHERE LIBRARY_BOOKS.BOOK_ID = BORROWBOOK.BOOK_ID;
+                UPDATE BORROWED_BOOKS SET BORROWER_ID = USER_ID WHERE B_BOOK_ID = (B_BOOK_SEQ + 1);
+                DBMS_OUTPUT.PUT_LINE('You have successfully borrowed the book ' || BOOK_NAME || '. Your Borrowing Book ID is ' || (B_BOOK_SEQ + 1));
+                BORROWED := 'TRUE';
+            END IF;
         ELSE -- IF IT IS RESERVED AND THERE'S ONLY 1 COPY LEFT, CHECK IF THE BORROWER IS THE SAME PERSON WHO RESERVED THE BOOK
-            DBMS_OUTPUT.PUT_LINE('I GOT HERE');
-            OPEN RESERVED_CURSOR;
-            DBMS_OUTPUT.PUT_LINE('I GOT HERE2');
-            LOOP
-                FETCH RESERVED_CURSOR INTO RBOOK_ID, RBORROWER_ID;
-                EXIT WHEN RESERVED_CURSOR%NOTFOUND;
-                IF RBOOK_ID = BOOK_ID AND RBORROWER_ID = USER_ID THEN -- IF THE BORROWER IS ALSO THE RESERVER
-                    UPDATE LIBRARY_BOOKS SET BOOK_COUNT = BOOK_COUNT - 1 WHERE LIBRARY_BOOKS.BOOK_ID = BORROWBOOK.BOOK_ID;
-                    UPDATE BORROWED_BOOKS SET BORROWER_ID = USER_ID WHERE B_BOOK_ID = (B_BOOK_SEQ + 1);
-                    DBMS_OUTPUT.PUT_LINE('You have successfully borrowed your reserved book ' || BOOK_NAME || '. Your Borrowing Book ID is ' || (B_BOOK_SEQ + 1));
-                    BORROWED := 'TRUE';
-                END IF;
-            END LOOP;
+            IF COPY_COUNT <> 0 THEN
+                SELECT RESERVER_ID INTO PRIORITY_ID
+                    FROM (
+                        SELECT RESERVER_ID, R_BOOK_ID
+                        FROM RESERVED_BOOKS
+                        WHERE BOOK_ID = BORROWBOOK.BOOK_ID
+                        ORDER BY R_BOOK_ID
+                        FETCH FIRST 1 ROW ONLY);
             
-            IF RESERVED_CURSOR%ISOPEN THEN
-                CLOSE RESERVED_CURSOR;
+                FOR REC IN (SELECT R_BOOK_ID, BOOK_ID, RESERVER_ID FROM RESERVED_BOOKS) LOOP
+                    IF REC.BOOK_ID = BOOK_ID AND REC.RESERVER_ID = USER_ID AND REC.RESERVER_ID = PRIORITY_ID THEN -- IF THE BORROWER IS ALSO THE RESERVER
+                        -- DO AN IF HERE TO CHECK IF THE LOWEST R_BOOK_ID IS THE ID OF THE PERSON BORROWING
+                        UPDATE LIBRARY_BOOKS SET BOOK_COUNT = BOOK_COUNT - 1 WHERE LIBRARY_BOOKS.BOOK_ID = BORROWBOOK.BOOK_ID;
+                        UPDATE BORROWED_BOOKS SET BORROWER_ID = USER_ID WHERE B_BOOK_ID = (B_BOOK_SEQ + 1);
+                        DELETE FROM RESERVED_BOOKS WHERE R_BOOK_ID = REC.R_BOOK_ID;
+                        DBMS_OUTPUT.PUT_LINE('You have successfully borrowed your reserved book ' || BOOK_NAME || '. Your Borrowing Book ID is ' || (B_BOOK_SEQ + 1));                    
+                        BORROWED := 'TRUE';
+                    END IF;
+                END LOOP;
+                
+                SELECT COUNT(*) INTO RESERVED_COUNT FROM RESERVED_BOOKS WHERE RESERVED_BOOKS.BOOK_NAME = BORROWBOOK.BOOK_NAME;
+                IF RESERVED_COUNT = 0 THEN
+                    UPDATE LIBRARY_BOOKS SET RESERVED = 'FALSE' WHERE LIBRARY_BOOKS.BOOK_ID = BORROWBOOK.BOOK_ID;
+                END IF;
             END IF;
         END IF;
         
         IF BORROWED = 'FALSE' THEN
-            DBMS_OUTPUT.PUT_LINE('Unable to borrow the book as there is only one copy available and it is reserved');
+            DBMS_OUTPUT.PUT_LINE('This book is unavailable for borrowing. You can reserve it and you will be notified when the book is available again.');
+            DBMS_OUTPUT.PUT_LINE('If you have already reserved this book, then you are in a queue for the book.');
+
         END IF;
         
     EXCEPTION
@@ -91,12 +100,15 @@ CREATE OR REPLACE PACKAGE BODY USERPACKAGE AS
     
     PROCEDURE RETURNBOOK (BOOK_ID NUMBER, USER_ID NUMBER) IS
         RECORD_COUNT NUMBER;
+        TITLE_COUNT NUMBER;
     BEGIN
         SELECT COUNT(*) INTO RECORD_COUNT FROM BORROWED_BOOKS WHERE BORROWED_BOOKS.BOOK_ID = BOOK_ID AND BORROWED_BOOKS.BORROWER_ID = USER_ID;
+        SELECT COUNT(*) INTO TITLE_COUNT FROM BORROWED_BOOKS WHERE BORROWED_BOOKS.BOOK_ID = BOOK_ID AND BORROWED_BOOKS.BORROWER_ID = USER_ID;
         
         IF RECORD_COUNT <> 0 THEN
             UPDATE LIBRARY_BOOKS SET BOOK_COUNT = BOOK_COUNT + 1 WHERE LIBRARY_BOOKS.BOOK_ID = BOOK_ID;
             DELETE FROM BORROWED_BOOKS WHERE BORROWED_BOOKS.BOOK_ID = BOOK_ID AND BORROWED_BOOKS.BORROWER_ID = USER_ID;
+            DBMS_OUTPUT.PUT_LINE('Thank you for returning the book you have borrowed.');
         ELSE 
             DBMS_OUTPUT.PUT_LINE('No record of a user borrowing the book you have entered.');
         END IF;
@@ -115,7 +127,7 @@ CREATE OR REPLACE PACKAGE BODY USERPACKAGE AS
         SELECT BOOK_NAME INTO BOOK_NAME FROM LIBRARY_BOOKS WHERE LIBRARY_BOOKS.BOOK_ID = RESERVEBOOK.BOOK_ID;
 
         UPDATE LIBRARY_BOOKS SET RESERVED = 'TRUE' WHERE LIBRARY_BOOKS.BOOK_ID = RESERVEBOOK.BOOK_ID;
-        UPDATE RESERVED_BOOKS SET BORROWER_ID = USER_ID WHERE R_BOOK_ID = (R_BOOK_SEQ + 1);
+        UPDATE RESERVED_BOOKS SET RESERVER_ID = USER_ID WHERE R_BOOK_ID = (R_BOOK_SEQ + 1);
         
         DBMS_OUTPUT.PUT_LINE('You have successfully reserved the book ' || BOOK_NAME || '. Your Reserving Book ID is ' || (R_BOOK_SEQ + 1));
     EXCEPTION
@@ -166,17 +178,17 @@ END;
 
 -- BORROW BOOK (WORKING)
 BEGIN
-    USERPACKAGE.BORROWBOOK(1055, 1);
+    USERPACKAGE.BORROWBOOK(1055, 4);
 END;
 
 -- RETURN BOOK (WORKING)
 BEGIN
-    USERPACKAGE.RETURNBOOK(1055, 2);
+    USERPACKAGE.RETURNBOOK(1055, 4);
 END;
 
 -- RESERVE BOOK (WORKING)
 BEGIN
-    USERPACKAGE.RESERVEBOOK(1055, 5);
+    USERPACKAGE.RESERVEBOOK(1055, 4);
 END;
 
 -- USER PACKAGE ENDS HERE
@@ -228,32 +240,68 @@ CREATE OR REPLACE PACKAGE BODY STAFFPACKAGE AS
     END DELETEBOOK;
     
     PROCEDURE GENERATEREPORT(REPORT_TYPE VARCHAR2) IS
+        -- Declare cursors for each report type
+        CURSOR BORROWED_CURSOR IS
+            SELECT * FROM BORROWED_BOOKS;
+        
+        CURSOR RESERVED_CURSOR IS
+            SELECT * FROM RESERVED_BOOKS;
+        
+        -- Declare variables to store fetched data
+        BORROWED_ID BORROWED_BOOKS.BOOK_ID%TYPE;
+        BORROWED_NAME BORROWED_BOOKS.BOOK_NAME%TYPE;
+        BORROWER_ID BORROWED_BOOKS.BORROWER_ID%TYPE;
+        
+        RESERVED_ID RESERVED_BOOKS.BOOK_ID%TYPE;
+        RESERVED_NAME RESERVED_BOOKS.BOOK_NAME%TYPE;
+        RESERVER_ID RESERVED_BOOKS.RESERVER_ID%TYPE;
     BEGIN
-        -- Generate report based on the specified type
+    -- Generate report based on the specified type
         IF REPORT_TYPE = 'BORROWED' THEN
-            FOR REC IN (SELECT * FROM BORROWED_BOOKS) LOOP
-                DBMS_OUTPUT.PUT_LINE('Book ID: ' || REC.BOOK_ID || ', Book Name: ' || REC.BOOK_NAME || ', User ID: ' || REC.BORROWER_ID);
+            -- Open the borrowed cursor
+            OPEN BORROWED_CURSOR;
+            
+            -- Fetch and print records
+            LOOP
+                FETCH BORROWED_CURSOR INTO BORROWED_ID, BORROWED_NAME, BORROWER_ID;
+                EXIT WHEN BORROWED_CURSOR%NOTFOUND;
+                DBMS_OUTPUT.PUT_LINE('Book ID: ' || BORROWED_ID || ', Book Name: ' || BORROWED_NAME || ', User ID: ' || BORROWER_ID);
             END LOOP;
+            
+            -- Close the borrowed cursor
+            CLOSE BORROWED_CURSOR;
+            
         ELSIF REPORT_TYPE = 'RESERVED' THEN
-            FOR REC IN (SELECT * FROM RESERVED_BOOKS) LOOP
-                DBMS_OUTPUT.PUT_LINE('Book ID: ' || REC.BOOK_ID || ', Book Name: ' || REC.BOOK_NAME || ', User ID: ' || REC.BORROWER_ID);
+            -- Open the reserved cursor
+            OPEN RESERVED_CURSOR;
+            
+            -- Fetch and print records
+            LOOP
+                FETCH RESERVED_CURSOR INTO RESERVED_ID, RESERVED_NAME, RESERVER_ID;
+                EXIT WHEN RESERVED_CURSOR%NOTFOUND;
+                DBMS_OUTPUT.PUT_LINE('Book ID: ' || RESERVED_ID || ', Book Name: ' || RESERVED_NAME || ', User ID: ' || RESERVER_ID);
             END LOOP;
+            
+            -- Close the reserved cursor
+            CLOSE RESERVED_CURSOR;
+            
         ELSE
             DBMS_OUTPUT.PUT_LINE('Error: Invalid report type.');
         END IF;
-    END GENERATEREPORT;
+END GENERATEREPORT;
+
     
 END STAFFPACKAGE;
 /
 
 -- ADD BOOK
 BEGIN
-    STAFFPACKAGE.ADDBOOK('Cook Book', 'E16R50', 4);
+    STAFFPACKAGE.ADDBOOK('Java Programming', 'D15R40', 4);
 END;
 
 -- DELETE BOOK
 BEGIN
-    STAFFPACKAGE.DELETEBOOK(1056, 35);
+    STAFFPACKAGE.DELETEBOOK(1055, 3);
 END;
 
 BEGIN
